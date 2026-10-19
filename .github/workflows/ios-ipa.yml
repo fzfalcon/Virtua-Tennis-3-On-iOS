@@ -1,0 +1,122 @@
+name: Build VT3 iOS IPA
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-ios:
+    # An Apple runner is required to compile MoltenVK, SDL3 and the iOS ARM64 app.
+    runs-on: macos-15
+    timeout-minutes: 360
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install host build tools
+        run: |
+          brew install cmake ninja glslang
+          python -m pip install --upgrade pip
+          python -m pip install pefile capstone
+
+      - name: Download owner-provided supported VT3.exe
+        env:
+          VT3_EXE_URL: ${{ secrets.VT3_EXE_URL }}
+          VT3_EXE_AUTH_HEADER: ${{ secrets.VT3_EXE_AUTH_HEADER }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "${VT3_EXE_URL:-}" ]]; then
+            echo "::error::Add a repository Actions secret named VT3_EXE_URL containing a direct HTTPS download URL for your own supported English v1.0.1 VT3.exe (or a zip containing it)."
+            exit 1
+          fi
+          args=(--fail --location --retry 3 --silent --show-error)
+          if [[ -n "${VT3_EXE_AUTH_HEADER:-}" ]]; then
+            args+=(--header "$VT3_EXE_AUTH_HEADER")
+          fi
+          curl "${args[@]}" "$VT3_EXE_URL" --output "$RUNNER_TEMP/VT3-input"
+          if file "$RUNNER_TEMP/VT3-input" | grep -qi 'HTML document'; then
+            echo "::error::The download URL returned an HTML page, not the game executable. Use a direct file-download URL."
+            exit 1
+          fi
+          mkdir -p "$RUNNER_TEMP/vt3-input"
+          if unzip -t "$RUNNER_TEMP/VT3-input" >/dev/null 2>&1; then
+            cp "$RUNNER_TEMP/VT3-input" "$RUNNER_TEMP/vt3-input/VT3.zip"
+          else
+            cp "$RUNNER_TEMP/VT3-input" "$RUNNER_TEMP/vt3-input/VT3.exe"
+          fi
+
+      - name: Build SDL3 for iOS device
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth 1 https://github.com/libsdl-org/SDL.git "$RUNNER_TEMP/SDL"
+          cmake -S "$RUNNER_TEMP/SDL" -B "$RUNNER_TEMP/SDL-build" -G Ninja \
+            -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_OSX_SYSROOT=iphoneos \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_OSX_DEPLOYMENT_TARGET=15.0 \
+            -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$RUNNER_TEMP/sdl-ios" \
+            -DSDL_SHARED=OFF -DSDL_STATIC=ON -DSDL_TESTS=OFF -DSDL_EXAMPLES=OFF
+          cmake --build "$RUNNER_TEMP/SDL-build" --parallel
+          cmake --install "$RUNNER_TEMP/SDL-build"
+          SDL3_DIR="$(find "$RUNNER_TEMP/sdl-ios" -name SDL3Config.cmake -print -quit | xargs dirname)"
+          test -n "$SDL3_DIR"
+          echo "SDL3_DIR=$SDL3_DIR" >> "$GITHUB_ENV"
+
+      - name: Build MoltenVK for iOS device
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth 1 https://github.com/KhronosGroup/MoltenVK.git "$RUNNER_TEMP/MoltenVK-src"
+          cd "$RUNNER_TEMP/MoltenVK-src"
+          ./fetchDependencies --ios
+          make ios
+          FRAMEWORK="$(find "$PWD/Package" -type d -path '*/ios-arm64/MoltenVK.framework' -print -quit)"
+          if [[ -z "$FRAMEWORK" || ! -f "$FRAMEWORK/MoltenVK" ]]; then
+            echo "::error::Could not find the iOS device MoltenVK.framework in MoltenVK's build output."
+            find "$PWD/Package" -maxdepth 5 -print | head -100
+            exit 1
+          fi
+          VULKAN_INCLUDE="$(find "$PWD" -path '*/vulkan/vulkan.h' -print -quit | xargs dirname | xargs dirname)"
+          test -f "$VULKAN_INCLUDE/vulkan/vulkan.h"
+          echo "VT3_MOLTENVK_FRAMEWORK=$FRAMEWORK" >> "$GITHUB_ENV"
+          echo "VT3_MOLTENVK_INCLUDE_DIR=$VULKAN_INCLUDE" >> "$GITHUB_ENV"
+          if file "$FRAMEWORK/MoltenVK" | grep -qi 'dynamically linked shared library'; then
+            echo "VT3_MOLTENVK_DYNAMIC=1" >> "$GITHUB_ENV"
+          else
+            echo "VT3_MOLTENVK_DYNAMIC=0" >> "$GITHUB_ENV"
+          fi
+
+      - name: Build and package unsigned IPA
+        shell: bash
+        run: |
+          set -euo pipefail
+          EXE="$RUNNER_TEMP/vt3-input/VT3.exe"
+          ZIP="$RUNNER_TEMP/vt3-input/VT3.zip"
+          if [[ -f "$ZIP" ]]; then
+            python - "$ZIP" "$RUNNER_TEMP/vt3-input" <<'PY'
+          import sys, zipfile, pathlib
+          zpath, out = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2])
+          with zipfile.ZipFile(zpath) as z:
+              candidates = [n for n in z.namelist() if n.lower().endswith('vt3.exe')]
+              if not candidates:
+                  raise SystemExit('Downloaded zip contains no VT3.exe')
+              (out / 'VT3.exe').write_bytes(z.read(candidates[0]))
+          PY
+          fi
+          test -f "$EXE"
+          python build.py ios --exe "$EXE"
+
+      - name: Upload unsigned IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: VT3-iOS-unsigned-IPA
+          path: build/ios/VT3-iOS-unsigned.ipa
+          if-no-files-found: error
+          retention-days: 7
